@@ -55,6 +55,7 @@ class SampleRequest:
     expected_output_len: int
     multi_modal_data: Optional[Union[MultiModalDataDict, dict]] = None
     lora_request: Optional[LoRARequest] = None
+    arrived_at: Optional[float] = None
 
 
 # -----------------------------------------------------------------------------
@@ -353,6 +354,71 @@ class RandomDataset(BenchmarkDataset):
                 ))
         return requests
 
+# -----------------------------------------------------------------------------
+# Trace Dataset Implementation (Synthetic Data with fixed srquence of input/output lengths)
+# -----------------------------------------------------------------------------
+
+
+class TraceDataset(BenchmarkDataset):
+    DEFAULT_PREFIX_LEN = 0
+
+    def __init__(
+        self,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading csv trace data.")
+
+        df = pd.read_csv(self.dataset_path)
+        self.input_lens = list(df['num_prefill_tokens'])
+        self.output_lens = list(df['num_decode_tokens'])
+        self.arrival_times = list(df['arrived_at'])
+
+    def sample(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        prefix_len: int = DEFAULT_PREFIX_LEN,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        
+        vocab_size = tokenizer.vocab_size
+
+        prefix_token_ids = (np.random.randint(
+            0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
+
+        # Add logging for debugging
+        trace_size = len(self.input_lens)
+        logger.info(f"Sampling {num_requests} from a trace daset of size {trace_size}")
+
+        # For now putting this restriction since oversampling does not fix the timestamps
+        assert num_requests <= trace_size, "There are not enough requests in the provided trace dataset"
+
+        output_size = min(num_requests, trace_size)
+        offsets = np.random.randint(0, vocab_size, size=output_size)
+
+        requests = []
+        for i in range(output_size):
+            inner_seq = ((offsets[i] + i + np.arange(self.input_lens[i])) %
+                         vocab_size).tolist()
+            token_sequence = prefix_token_ids + inner_seq
+            prompt = tokenizer.decode(token_sequence)
+            total_input_len = prefix_len + int(self.input_lens[i])
+            requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=total_input_len,
+                    expected_output_len=int(self.output_lens[i]),
+                    arrived_at=self.arrival_times[i]
+                ))
+        
+        self.maybe_oversample_requests(requests, num_requests)
+
+        return requests
 
 # -----------------------------------------------------------------------------
 # ShareGPT Dataset Implementation

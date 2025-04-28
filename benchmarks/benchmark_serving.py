@@ -52,7 +52,7 @@ except ImportError:
 
 from benchmark_dataset import (AIMODataset, ASRDataset, BurstGPTDataset,
                                ConversationDataset, HuggingFaceDataset,
-                               InstructCoderDataset, RandomDataset,
+                               InstructCoderDataset, RandomDataset, TraceDataset,
                                SampleRequest, ShareGPTDataset, SonnetDataset,
                                VisionArenaDataset)
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
@@ -89,19 +89,13 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
 
-
-async def get_request(
-    input_requests: list[SampleRequest],
-    request_rate: float,
-    burstiness: float = 1.0,
-) -> AsyncGenerator[SampleRequest, None]:
+def assign_request_arrival_times(input_requests: list[SampleRequest], request_rate: float, burstiness: float = 1.0):
     """
-    Asynchronously generates requests at a specified rate
-    with OPTIONAL burstiness.
+    Populate request arrival time for a set of input requests based on request rate and burstiness factor
 
     Args:
         input_requests:
-            A list of input requests, each represented as a SampleRequest.
+            A list of requests for which arrival timestamp to be populated
         request_rate:
             The rate at which requests are generated (requests/s).
         burstiness (optional):
@@ -113,25 +107,45 @@ async def get_request(
             in more bursty requests, while a higher burstiness value
             (burstiness > 1) results in a more uniform arrival of requests.
     """
-    input_requests: Iterable[SampleRequest] = iter(input_requests)
-
     # Calculate scale parameter theta to maintain the desired request_rate.
     assert burstiness > 0, (
         f"A positive burstiness factor is expected, but given {burstiness}.")
     theta = 1.0 / (request_rate * burstiness)
 
-    for request in input_requests:
-        yield request
+    arrival_times = []
+    cur_time = 0
+    for sample_request in input_requests:
+        # honor the existing timestamp eg from trace dataset
+        if sample_request.arrived_at is not None:
+            continue 
 
+        sample_request.arrived_at = cur_time
         if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
             continue
-
         # Sample the request interval from the gamma distribution.
         # If burstiness is 1, it follows exponential distribution.
-        interval = np.random.gamma(shape=burstiness, scale=theta)
-        # The next request will be sent after the interval.
-        await asyncio.sleep(interval)
+        cur_time += np.random.gamma(shape=burstiness, scale=theta)    
+    
+
+async def get_request(
+    input_requests: list[SampleRequest]
+) -> AsyncGenerator[SampleRequest, None]:
+    """
+    Asynchronously generates requests at a specified timestamps
+
+    Args:
+        input_requests:
+            A list of input requests, each represented as a SampleRequest with a specific timestamp
+    """
+    input_requests: Iterable[SampleRequest] = iter(input_requests)
+
+    t0 = cur_time = time.perf_counter()
+    for request in input_requests:
+        if request.arrived_at + t0 > cur_time:
+            await asyncio.sleep(request.arrived_at + t0 - cur_time)
+            cur_time = time.perf_counter()
+        
+        yield request
 
 
 def calculate_metrics(
@@ -251,8 +265,6 @@ async def benchmark(
     tokenizer: PreTrainedTokenizerBase,
     input_requests: list[SampleRequest],
     logprobs: Optional[int],
-    request_rate: float,
-    burstiness: float,
     disable_tqdm: bool,
     profile: bool,
     selected_percentile_metrics: list[str],
@@ -318,13 +330,6 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
-    if burstiness == 1.0:
-        distribution = "Poisson process"
-    else:
-        distribution = "Gamma distribution"
-
-    print(f"Traffic request rate: {request_rate}")
-    print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
@@ -346,7 +351,7 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, burstiness):
+    async for request in get_request(input_requests):
         prompt, prompt_len, output_len, mm_content = request.prompt, \
             request.prompt_len, request.expected_output_len, \
                 request.multi_modal_data
@@ -654,6 +659,12 @@ def main(args: argparse.Namespace):
                 input_len=args.random_input_len,
                 output_len=args.random_output_len,
                 range_ratio=args.random_range_ratio,
+            ),
+            "trace":
+            lambda: TraceDataset(dataset_path=args.dataset_path).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                prefix_len=args.random_prefix_len,
             )
         }
 
@@ -683,6 +694,12 @@ def main(args: argparse.Namespace):
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
 
+    # Update each sample request with arrival timestamp
+    assign_request_arrival_times(input_requests, args.request_rate, args.burstiness)
+
+    print(f"Sending {len(input_requests)} in {np.round(input_requests[-1].arrived_at, 1)} seconds - "
+          f"QPS: {np.round(len(input_requests) / input_requests[-1].arrived_at, 2) if input_requests[-1].arrived_at else 'inf'}")
+
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()
     gc.freeze()
@@ -697,8 +714,6 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
             input_requests=input_requests,
             logprobs=args.logprobs,
-            request_rate=args.request_rate,
-            burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
             selected_percentile_metrics=args.percentile_metrics.split(","),
@@ -795,13 +810,13 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "trace"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
                         type=str,
                         default=None,
-                        help="Path to the sharegpt/sonnet dataset. "
+                        help="Path to the sharegpt/sonnet/trace dataset. "
                         "Or the huggingface dataset ID if using HF dataset.")
     parser.add_argument(
         "--max-concurrency",
@@ -852,7 +867,8 @@ if __name__ == "__main__":
         help="Number of requests per second. If this is inf, "
         "then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process or gamma distribution "
-        "to synthesize the request arrival times.",
+        "to synthesize the request arrival times. For dataset type 'trace'" 
+        "request arrival times are set in dataset",
     )
     parser.add_argument(
         "--burstiness",
@@ -864,7 +880,8 @@ if __name__ == "__main__":
         "Otherwise, the request intervals follow a gamma distribution. "
         "A lower burstiness value (0 < burstiness < 1) results in more "
         "bursty requests. A higher burstiness value (burstiness > 1) "
-        "results in a more uniform arrival of requests.",
+        "results in a more uniform arrival of requests. For dataset type 'trace'" 
+        "request arrival times are set in dataset",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
