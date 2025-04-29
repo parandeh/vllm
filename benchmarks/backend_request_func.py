@@ -42,6 +42,7 @@ class RequestFuncOutput:
     success: bool = False
     latency: float = 0.0
     output_tokens: int = 0
+    request_id: str = ""
     ttft: float = 0.0  # Time to first token
     itl: list[float] = field(
         default_factory=list)  # list of inter-token latencies
@@ -309,7 +310,7 @@ async def async_request_openai_completions(
                                     first_chunk_received = True
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
-
+                                    output.request_id = data.get("id")
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp -
