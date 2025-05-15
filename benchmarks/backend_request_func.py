@@ -274,7 +274,8 @@ async def async_request_openai_completions(
         if request_func_input.extra_body:
             payload.update(request_func_input.extra_body)
         headers = {
-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+            "x-prefill-tokens": str(request_func_input.prompt_len)
         }
 
         output = RequestFuncOutput()
